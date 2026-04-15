@@ -1,120 +1,143 @@
 "use strict";
 
-const $ = (id) => document.getElementById(id);
-// ใช้ var เพื่อให้มั่นใจว่าเรียกใช้งานได้จากทุกฟังก์ชัน
-var piCapturedFilename = null; 
+if (typeof getEl === 'undefined') {
+    var getEl = (id) => document.getElementById(id);
+}
 
-/** ── 1. ฟังก์ชันถ่ายภาพ (Capture) ── */
+var piCapturedFilename = null; 
+var lastDetectionData = null; // ✅ เพิ่มเพื่อเก็บข้อมูล AI ล่าสุดไว้บันทึก
+
+/** ── 1. ถ่ายภาพ ── */
 async function captureFromPi() {
-    console.log("📸 เริ่มสั่งถ่ายภาพ...");
     showLoading(true, "กำลังบันทึกภาพจากกล้อง...");
-    
     try {
         const res = await fetch("/api/capture", { method: "POST" });
         const data = await res.json();
-
         if (data.success) {
-            const img = $("preview-img");
-            // 1. หยุดภาพสดและโชว์ภาพนิ่งที่ถ่ายได้ทันที
-            // เพิ่ม ?t= เพื่อป้องกัน Browser จำภาพเก่า (Cache)
-            img.src = data.image_url + "?t=" + new Date().getTime();
-            
-            // 2. เก็บชื่อไฟล์ไว้ในตัวแปรเพื่อส่งไปตรวจจับ
+            const img = getEl("preview-img");
+            if (img) {
+                img.src = data.image_url; 
+                img.style.display = "block";
+            }
             piCapturedFilename = data.filename; 
-            
-            console.log("✅ ถ่ายสำเร็จ ไฟล์ชื่อ:", piCapturedFilename);
-            showToast("📸 ถ่ายภาพสำเร็จ! ตรวจสอบภาพแล้วกดเริ่มตรวจจับ", "success");
-        } else {
-            showToast("❌ ถ่ายภาพล้มเหลว: " + (data.error || "Unknown"), "error");
+            showToast("📸 ถ่ายภาพสำเร็จ!", "success");
         }
-    } catch (err) {
-        console.error("Capture Error:", err);
-        showToast("❌ เชื่อมต่อกล้องไม่ได้", "error");
-    }
+    } catch (err) { console.error(err); }
     showLoading(false);
 }
 
-/** ── 2. ฟังก์ชันตรวจจับ (Detection) ── */
+/** ── 2. ตรวจจับ (Detection) ── */
 async function startDetection() {
-    console.log("🚀 กำลังส่งภาพไปวิเคราะห์ AI...");
-    
     if (!piCapturedFilename) {
-        showToast("⚠️ ต้องถ่ายภาพก่อนเริ่มตรวจจับครับ", "error");
+        showToast("⚠️ ต้องถ่ายภาพก่อนครับ", "error");
         return;
     }
-
-    showLoading(true, "AI กำลังวิเคราะห์อาหารและคำนวณราคา...");
+    showLoading(true, "AI กำลังวิเคราะห์อาหาร...");
     try {
         const res = await fetch("/api/detect-captured", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ filename: piCapturedFilename })
         });
-
         const data = await res.json();
         if (data.success) {
-            // ✅ แสดงผลลัพธ์ลงใน Result Screen
+            lastDetectionData = data; // ✅ เก็บข้อมูลไว้ส่งไปบันทึกตอนกดยืนยัน
             renderResult(data); 
             showScreen("result-screen");
-        } else {
-            showToast("❌ วิเคราะห์ล้มเหลว: " + data.error, "error");
         }
-    } catch (err) {
-        console.error("Detection Error:", err);
-        showToast("❌ การเชื่อมต่อล้มเหลว", "error");
+    } catch (err) { console.error(err); }
+    showLoading(false);
+}
+
+/** ── 3. ยืนยันและบันทึกข้อมูล (goToEnd) ── */
+async function goToEnd() {
+    if (!piCapturedFilename || !lastDetectionData) {
+        showToast("❌ ไม่พบข้อมูลการตรวจจับ", "error");
+        return;
+    }
+
+    showLoading(true, "กำลังบันทึกลงฐานข้อมูล...");
+    try {
+        // ดึงค่าน้ำหนักปัจจุบันจากหน้าจอ
+        const weightVal = parseFloat(getEl("weight-display")?.textContent || "0");
+        
+        const res = await fetch("/api/confirm", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                filename: piCapturedFilename,
+                total_price: lastDetectionData.total_price,
+                dishes: lastDetectionData.dishes,
+                weight: weightVal
+            })
+        });
+
+        const result = await res.json();
+        if (result.success) {
+            showScreen("end-screen");
+            startCountdown(5); // นับถอยหลัง 5 วิกลับหน้าแรก
+        } else {
+            showToast("❌ บันทึกล้มเหลว", "error");
+        }
+    } catch (err) { 
+        console.error(err);
+        showToast("❌ ติดต่อเซิร์ฟเวอร์ไม่ได้", "error"); 
     }
     showLoading(false);
 }
 
-/** ── 3. ฟังก์ชันแสดงผลลัพธ์ (Render) ── */
+/** ── 4. แสดงผลลัพธ์ ── */
 function renderResult(data) {
-    // โชว์ภาพที่วาดกรอบแล้ว (Annotated Image)
-    const ri = $("result-img");
-    if (ri) ri.src = data.annotated_image || "";
-
-    // โชว์รายการอาหาร
-    const list = $("menu-list");
+    const ri = getEl("result-img");
+    if (ri) ri.src = data.annotated_image;
+    const list = getEl("menu-list");
     if (list) {
         const dishes = data.dishes || [];
-        if (dishes.length === 0) {
-            list.innerHTML = `<div style="text-align:center;padding:20px;color:#64748b;">ไม่พบรายการอาหาร</div>`;
-        } else {
-            list.innerHTML = dishes.map((dish) => `
-                <div class="menu-card" style="background:#6d28d9; border-radius:10px; padding:15px; margin-bottom:10px; color:white; display:flex; justify-content:space-between;">
-                    <span style="font-weight:600;">${dish.name_th || dish.name}</span>
-                    <span>฿${Math.round(dish.price)}</span>
-                </div>
-            `).join("");
-        }
+        list.innerHTML = dishes.map(dish => `
+            <div class="menu-card" style="background:#6d28d9; border-radius:10px; padding:15px; margin-bottom:10px; color:white; display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-weight:600;">${dish.name_th || dish.name}</span>
+                <span style="font-weight:bold;">฿${Math.round(dish.price)}</span>
+            </div>
+        `).join("");
     }
-    // โชว์ราคาทั้งหมด
-    const totalPrice = $("total-price-display");
-    if (totalPrice) totalPrice.textContent = Math.round(data.total_price || 0);
+    const total = getEl("total-price-display");
+    if (total) total.textContent = Math.round(data.total_price || 0);
 }
 
-/** ── 4. จัดการหน้าจอและ Helper ── */
+/** ── ฟังก์ชันเสริม ── */
+function startCountdown(seconds) {
+    let n = seconds;
+    const el = getEl("countdown-num");
+    const timer = setInterval(() => {
+        n--;
+        if (el) el.textContent = n;
+        if (n <= 0) { clearInterval(timer); goHome(); }
+    }, 1000);
+}
+
 function showScreen(id) {
     document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
-    $(id).classList.add("active");
+    getEl(id)?.classList.add("active");
 }
 
 function goHome() {
     piCapturedFilename = null;
-    const img = $("preview-img");
-    if (img) img.src = "/video_feed"; // กลับไปโชว์ภาพสด
+    lastDetectionData = null;
+    const img = getEl("preview-img");
+    if (img) img.src = "/video_feed"; 
     showScreen("home-screen");
 }
 
 function showLoading(show, text = "") {
-    const el = $("loading-overlay");
+    const el = getEl("loading-overlay");
     if (el) {
-        if (text) $("loader-text").textContent = text;
+        if (text) getEl("loader-text").textContent = text;
         el.classList.toggle("show", show);
     }
 }
 
 function showToast(msg, type = "") {
-    const el = $("toast");
+    const el = getEl("toast");
     if (el) {
         el.textContent = msg;
         el.className = `show ${type}`;
@@ -122,14 +145,4 @@ function showToast(msg, type = "") {
     }
 }
 
-// เริ่มต้นระบบเมื่อโหลดหน้าเสร็จ
-window.onload = () => {
-    console.log("✅ ระบบหน้าจอพร้อมใช้งาน");
-    const uploadRow = $("upload-row");
-    if (uploadRow) uploadRow.style.setProperty("display", "flex", "important");
-    const detectBtn = $("detect-btn");
-    if (detectBtn) {
-        detectBtn.style.display = "block";
-        detectBtn.disabled = false;
-    }
-};
+window.onload = () => { console.log("✅ ระบบพร้อมใช้งาน"); };

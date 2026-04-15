@@ -1,122 +1,300 @@
-import uuid
+"""
+detector.py
+─────────────────────────────────────────────────────────
+Logic การตรวจจับอาหารด้วย YOLOv8
+
+โหมดการทำงาน:
+  YOLO mode เท่านั้น — ต้องติดตั้ง ultralytics และมี models/best.pt
+
+หมายเหตุ:
+  ใช้ Pillow วาดข้อความภาษาไทยบน bounding box
+  เพราะ cv2.putText() ไม่รองรับ Unicode / ภาษาไทย
+
+แก้ไขที่นี่เมื่อ:
+  - ปรับ threshold หรือ post-processing
+  - เปลี่ยนขนาด / สี label
+  - เพิ่ม preprocessing ภาพ
+─────────────────────────────────────────────────────────
+"""
+
 import logging
-import os
 from pathlib import Path
-import cv2
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from ultralytics import YOLO  # ✅ ต้องติดตั้ง pip install ultralytics
+from ultralytics import YOLO
 
-from config import MODEL_PATH, UPLOAD_DIR, MENU_PATH
+from config import MODEL_PATH, UPLOAD_DIR, DetectionConfig, MENU_PATH
 from utils import load_menu
 
 logger = logging.getLogger(__name__)
 
-# ── สีของ bounding box ────────────────
-BOX_COLORS_RGB = [(0, 229, 160), (0, 153, 255), (255, 107, 53), (176, 106, 255)]
-
-# ── ฟอนต์ภาษาไทย ──────────────────────
-_FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/tlwg/Loma.ttf",
-    "/usr/share/fonts/truetype/thai/Garuda.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+# ── สีของ bounding box (RGB สำหรับ Pillow) ────────────────
+BOX_COLORS_RGB = [
+    (0, 229, 160),  # เขียว
+    (0, 153, 255),  # น้ำเงิน
+    (255, 107, 53),  # ส้ม
+    (176, 106, 255),  # ม่วง
+    (255, 210, 63),  # เหลือง
+    (53, 211, 255),  # ฟ้า
 ]
 
-def _find_thai_font(size: int = 20) -> ImageFont.FreeTypeFont:
+# ── ฟอนต์ภาษาไทย ──────────────────────────────────────────
+_FONT_CANDIDATES = [
+    # Raspberry Pi OS / Debian
+    "/usr/share/fonts/opentype/tlwg/Loma.otf",
+    "/usr/share/fonts/truetype/tlwg/Loma.ttf",
+    "/usr/share/fonts/opentype/tlwg/Garuda.otf",
+    "/usr/share/fonts/truetype/thai/Garuda.ttf",
+    # Ubuntu / Noto
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    # macOS
+    "/Library/Fonts/Thonburi.ttf",
+    "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
+    # Windows
+    "C:/Windows/Fonts/tahoma.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+]
+
+
+def _find_thai_font(size: int = 18) -> ImageFont.FreeTypeFont:
+    """หาฟอนต์ที่รองรับภาษาไทย คืน default ถ้าไม่พบ"""
     for path in _FONT_CANDIDATES:
         if Path(path).exists():
-            return ImageFont.truetype(path, size)
+            try:
+                logger.debug("Using font: %s", path)
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    logger.warning("No Thai font found — using PIL default (Thai may not display)")
     return ImageFont.load_default()
 
+
 class FoodDetector:
+    """ตรวจจับอาหารจากภาพด้วย YOLOv8"""
+
     def __init__(self):
-        # 1. โหลดเมนูราคาจาก JSON
         self.menu = load_menu(MENU_PATH)
+        self.model = self._load_model()  # ← try/except แทน raise
+        self._is_pi = self._detect_raspberry_pi()
         self._font_label = _find_thai_font(size=22)
-        
-        # 2. โหลด YOLO Model (best.pt)
-        self.model = None
+        self._font_small = _find_thai_font(size=14)
+        logger.info(
+            "FoodDetector ready | pi=%s | model=%s",
+            self._is_pi,
+            "loaded" if self.model else "NOT FOUND",
+        )
+
+    # ── Initialisation ─────────────────────────────────────
+
+    def _load_model(self) -> YOLO | None:
+        """โหลด YOLOv8 model — คืน None แทน raise ถ้าไม่พบไฟล์"""
         try:
-            if os.path.exists(MODEL_PATH):
-                # โหลดโมเดล (บน Pi 5 แนะนำให้ใช้ .pt หรือแปลงเป็น .engine/ncnn เพื่อความเร็ว)
-                self.model = YOLO(MODEL_PATH)
-                logger.info(f"✅ FoodDetector: Loaded model from {MODEL_PATH}")
-            else:
-                logger.error(f"❌ Model file NOT FOUND at {MODEL_PATH}")
+            if not MODEL_PATH.exists():
+                logger.error("Model file NOT FOUND at %s", MODEL_PATH)
+                return None
+            model = YOLO(str(MODEL_PATH))
+            logger.info("YOLOv8 loaded: %s", MODEL_PATH)
+            return model
         except Exception as e:
-            logger.error(f"❌ Failed to load YOLO model: {e}")
+            logger.error("Failed to load YOLO model: %s", e)
+            return None
+
+    def _detect_raspberry_pi(self) -> bool:
+        try:
+            return "raspberry" in Path("/proc/device-tree/model").read_text().lower()
+        except Exception:
+            return False
+
+    # ── Public API ─────────────────────────────────────────
+
+    def get_status(self) -> dict:
+        """คืนสถานะ — ใช้โดย status_bp"""
+        return {
+            "model_loaded": self.model is not None,
+            "is_raspberry_pi": self._is_pi,
+            "platform": "Raspberry Pi 5" if self._is_pi else "Development PC",
+            "mode": "yolo",
+        }
 
     def detect(self, image_path: str) -> dict:
-        """ตรวจจับอาหารด้วย Model YOLO จริง"""
         if not Path(image_path).exists():
             return {"success": False, "error": f"Image not found: {image_path}"}
-        
-        if self.model is None:
+        if self.model is None:  # ← guard จากโค้ดใหม่
             return {"success": False, "error": "Model not initialized"}
+        return self._detect_yolo(image_path)
 
+    # ── YOLO Detection ─────────────────────────────────────
+
+    def _detect_yolo(self, image_path: str) -> dict:
         try:
-            # 1. รันการตรวจจับ (Inference)
-            # stream=False เพื่อรอผลลัพธ์, conf=0.4 คือค่าความมั่นใจขั้นต่ำ
-            results = self.model.predict(image_path, conf=0.4, device='cpu')[0]
-            
+            results = self.model.predict(
+                image_path,
+                conf=DetectionConfig.CONFIDENCE,
+                iou=DetectionConfig.IOU_THRESHOLD,
+                imgsz=DetectionConfig.IMG_SIZE,
+                max_det=DetectionConfig.MAX_DETECTIONS,
+                device="cpu",
+            )[0]
+
             pil_img = Image.open(image_path).convert("RGB")
             detections = []
-            total_price = 0
 
-            # 2. ประมวลผลผลลัพธ์แต่ละ Object ที่เจอ
             for i, box in enumerate(results.boxes):
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
-                label_en = results.names[cls_id] # ชื่อ class ภาษาอังกฤษที่เทรนมา
-                
-                # ดึงข้อมูลจาก menu.json ตามชื่อ class
-                item = self.menu.get(label_en, {"name_th": label_en, "price": 0})
-                
-                # พิกัด Bounding Box [x1, y1, x2, y2]
+                label_en = results.names[cls_id]
                 b = box.xyxy[0].cpu().numpy()
+
+                item = self.menu.get(label_en, self.menu.get("unknown", {}))
                 det = {
                     "name": label_en,
                     "name_th": item.get("name_th", label_en),
+                    "name_en": item.get("name_en", label_en),
                     "confidence": round(conf, 2),
                     "price": item.get("price", 0),
-                    "bbox": {"x1": int(b[0]), "y1": int(b[1]), "x2": int(b[2]), "y2": int(b[3])},
+                    "weight": 0.0,
+                    "bbox": {
+                        "x1": int(b[0]),
+                        "y1": int(b[1]),
+                        "x2": int(b[2]),
+                        "y2": int(b[3]),
+                    },
                 }
-
                 detections.append(det)
-                total_price += det["price"]
-
-                # วาดกรอบและภาษาไทยลงบนภาพ
                 self._draw_box_pil(pil_img, det, i)
 
-            # 3. บันทึกภาพที่วาดกรอบแล้ว
-            p = Path(image_path)
-            annotated_path = str(p.parent / f"annotated_{p.name}")
-            pil_img.save(annotated_path, "JPEG", quality=95)
-
-            return {
+            annotated_path = self._save_annotated_pil(pil_img, image_path)
+            out = {
                 "success": True,
                 "detections": detections,
-                "total_price": total_price,
+                "total_price": sum(d["price"] for d in detections),
                 "annotated_path": annotated_path,
-                "count": len(detections)
+                "count": len(detections),
+                "mock": False,
             }
+            out["menus"] = self._build_menus_hierarchy(detections)
+            return out
 
-        except Exception as e:
-            logger.error(f"Detection failed: {e}")
-            return {"success": False, "error": str(e)}
+        except Exception as exc:
+            logger.exception("YOLO detection error")
+            return {"success": False, "error": str(exc)}
 
-    def _draw_box_pil(self, img, det, idx):
+    # ── Menu hierarchy ─────────────────────────────────────
+
+    @staticmethod
+    def _bbox_area(b: dict) -> float:
+        w = max(0, b.get("x2", 0) - b.get("x1", 0))
+        h = max(0, b.get("y2", 0) - b.get("y1", 0))
+        return w * h
+
+    @staticmethod
+    def _bbox_center(b: dict) -> tuple[float, float]:
+        return (
+            (b.get("x1", 0) + b.get("x2", 0)) / 2,
+            (b.get("y1", 0) + b.get("y2", 0)) / 2,
+        )
+
+    @classmethod
+    def _build_menus_hierarchy(cls, detections: list[dict]) -> list[dict]:
+        if not detections:
+            return []
+
+        def contains(outer: dict, inner: dict) -> bool:
+            ob = outer.get("bbox") or {}
+            ib = inner.get("bbox") or {}
+            cx, cy = cls._bbox_center(ib)
+            x1, y1 = ob.get("x1", 0), ob.get("y1", 0)
+            x2, y2 = ob.get("x2", 0), ob.get("y2", 0)
+            if x1 >= x2 or y1 >= y2:
+                return False
+            return x1 <= cx <= x2 and y1 <= cy <= y2
+
+        areas = [cls._bbox_area(d.get("bbox") or {}) for d in detections]
+        parent_idx = [None] * len(detections)
+
+        for i, det in enumerate(detections):
+            candidates = [
+                j
+                for j in range(len(detections))
+                if j != i and areas[j] > areas[i] and contains(detections[j], det)
+            ]
+            if candidates:
+                parent_idx[i] = min(candidates, key=lambda j: areas[j])
+
+        root_indices = [i for i in range(len(detections)) if parent_idx[i] is None]
+        root_indices.sort(
+            key=lambda i: (
+                (detections[i].get("bbox") or {}).get("y1", 0),
+                (detections[i].get("bbox") or {}).get("x1", 0),
+            )
+        )
+
+        menus = []
+        for ri in root_indices:
+            det = detections[ri]
+            children = [j for j in range(len(detections)) if parent_idx[j] == ri]
+            confs = [det.get("confidence", 0)] + [
+                detections[j].get("confidence", 0) for j in children
+            ]
+            menus.append(
+                {
+                    "name": det.get("name", ""),
+                    "name_th": det.get("name_th", det.get("name", "")),
+                    "name_en": det.get("name_en", ""),
+                    "confidence": det.get("confidence", 0),
+                    "accuracy_avg": round(sum(confs) / len(confs), 3),
+                    "price": det.get("price", 0),
+                    "weight": det.get("weight", 0.0),
+                    "ingredients": [
+                        {
+                            "name": detections[j].get("name", ""),
+                            "name_th": detections[j].get("name_th", ""),
+                            "name_en": detections[j].get("name_en", ""),
+                            "confidence": detections[j].get("confidence", 0),
+                            "price": 0,
+                        }
+                        for j in children
+                    ],
+                }
+            )
+        return menus
+
+    # ── Drawing ─────────────────────────────────────────────
+
+    def _draw_box_pil(self, img: Image.Image, det: dict, idx: int) -> None:
         color = BOX_COLORS_RGB[idx % len(BOX_COLORS_RGB)]
         b = det["bbox"]
         draw = ImageDraw.Draw(img)
-        
-        # วาดกรอบ
-        draw.rectangle([b["x1"], b["y1"], b["x2"], b["y2"]], outline=color, width=5)
-        
-        # วาดพื้นหลังข้อความ
-        label_text = f"{det['name_th']} {int(det['confidence']*100)}%"
+
+        draw.rectangle(
+            [b["x1"], b["y1"], b["x2"], b["y2"]],
+            outline=color,
+            width=5,
+        )
+
+        label_text = (
+            f"{det['name_th']} {int(det['confidence'] * 100)}%  ฿{det['price']}"
+        )
         text_bbox = draw.textbbox((b["x1"], b["y1"]), label_text, font=self._font_label)
-        draw.rectangle([text_bbox[0], text_bbox[1]-5, text_bbox[2]+10, text_bbox[3]+5], fill=color)
-        
-        # วาดข้อความภาษาไทย (สีขาว)
-        draw.text((b["x1"] + 5, b["y1"] - 30), label_text, font=self._font_label, fill=(255, 255, 255))
+        tw = text_bbox[2] - text_bbox[0]
+        th = text_bbox[3] - text_bbox[1]
+
+        draw.rectangle(
+            [b["x1"], b["y1"] - th - 10, b["x1"] + tw + 10, b["y1"]],
+            fill=color,
+        )
+        draw.text(
+            (b["x1"] + 5, b["y1"] - th - 5),
+            label_text,
+            font=self._font_label,
+            fill=(255, 255, 255),
+        )
+
+    @staticmethod
+    def _save_annotated_pil(img: Image.Image, original_path: str) -> str:
+        p = Path(original_path)
+        out = p.parent / f"annotated_{p.stem}.jpg"
+        img.save(str(out), "JPEG", quality=95)
+        return str(out)

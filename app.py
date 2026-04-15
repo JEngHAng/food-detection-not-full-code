@@ -1,6 +1,7 @@
 import logging
 import time
 import os
+import sqlite3 # ✅ เพิ่ม import sqlite3 สำหรับฐานข้อมูล
 from flask import Flask, jsonify, render_template, send_from_directory, Response, request
 from flask_cors import CORS
 from config import ServerConfig, DB_PATH, UPLOAD_DIR
@@ -11,6 +12,11 @@ from hardware.camera import PiCamera
 app = Flask(__name__)
 CORS(app)
 app.config["UPLOAD_FOLDER"] = str(UPLOAD_DIR)
+
+# ตรวจสอบว่ามีโฟลเดอร์สำหรับเซฟรูปหรือยัง
+if not os.path.exists(app.config["UPLOAD_FOLDER"]):
+    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
 init_db(str(DB_PATH))
 
 app.detector = FoodDetector()
@@ -36,7 +42,7 @@ def capture_api():
     path = app.camera.capture()
     if path:
         filename = os.path.basename(path)
-        # ✅ ใส่ Timestamp กลับไปใน JSON เลยเพื่อให้ JS ใช้งานง่าย
+        # ส่ง image_url พร้อม Timestamp เพื่อป้องกัน Browser จำภาพเก่า (Cache)
         return jsonify({
             "success": True, 
             "filename": filename,
@@ -62,6 +68,50 @@ def detect_api():
         "pending_file": filename
     })
 
+# 🚩 เพิ่ม API สำหรับบันทึกข้อมูลลง SQLite (goToEnd เรียกใช้ตัวนี้)
+@app.route("/api/confirm", methods=["POST"])
+def confirm_api():
+    try:
+        data = request.get_json()
+        filename = data.get("filename")
+        total_price = data.get("total_price", 0)
+        weight = data.get("weight", 0)
+        dishes = data.get("dishes", [])
+
+        # รวมชื่อรายการอาหารเป็นข้อความเดียว (คั่นด้วยลูกน้ำ)
+        dishes_str = ", ".join([d.get('name_th', d.get('name', '')) for d in dishes])
+
+        # เชื่อมต่อและบันทึกลงฐานข้อมูล
+        conn = sqlite3.connect(str(DB_PATH))
+        cursor = conn.cursor()
+        
+        # สร้าง Table หากยังไม่มี
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS detections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT,
+                dishes TEXT,
+                weight REAL,
+                total_price REAL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            INSERT INTO detections (filename, dishes, weight, total_price)
+            VALUES (?, ?, ?, ?)
+        ''', (filename, dishes_str, weight, total_price))
+        
+        conn.commit()
+        conn.close()
+        
+        logging.info(f"✅ บันทึกข้อมูลสำเร็จ: {filename}")
+        return jsonify({"success": True, "message": "บันทึกข้อมูลลง SQLite เรียบร้อย"})
+    except Exception as e:
+        logging.error(f"❌ Error saving to DB: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# Route เพื่อให้ Browser เข้ามาดึงรูปภาพพรีวิวไปโชว์ได้
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
